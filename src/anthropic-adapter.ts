@@ -52,26 +52,47 @@ type AnthropicUsage = {
 
 // ── 辅助函数 ────────────────────────────────────────────────────────────────
 
+// Math.max(0, ms) 防止负数传入 setTimeout 导致行为不确定
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, Math.max(0, ms)))
 }
 
+// 429 = 限流（Too Many Requests），5xx = 服务端临时错误，这两类值得重试
+// 4xx 的其他状态码（如 400 参数错误、401 鉴权失败）是客户端问题，重试没有意义
 function shouldRetry(status: number): boolean {
   return status === 429 || (status >= 500 && status < 600)
 }
 
+/**
+ * 解析 Retry-After 响应头，返回应等待的毫秒数。
+ *
+ * HTTP 标准允许两种格式：
+ *   - 数字字符串："30"  → 表示等待 30 秒
+ *   - HTTP 日期字符串："Wed, 21 Oct 2025 07:28:00 GMT" → 表示等到该时刻
+ *
+ * 返回 null 表示响应头不存在或无法解析，调用方会 fallback 到指数退避。
+ */
 function parseRetryAfterMs(value: string | null): number | null {
   if (!value) return null
   const asSeconds = Number(value)
   if (Number.isFinite(asSeconds) && asSeconds >= 0) return Math.floor(asSeconds * 1000)
   const at = Date.parse(value)
+  // Math.max(0, ...) 防止服务端给了一个过去的时间导致负数等待
   return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null
 }
 
 /**
- * [K-07] 指数退避 + Jitter
- * base = min(500 * 2^(attempt-1), 8000)
- * delay = base * (1 + random * 0.25)
+ * [K-07] 计算本次重试应等待的毫秒数。
+ *
+ * 优先级：Retry-After 响应头 > 指数退避自算
+ *
+ * 指数退避公式：
+ *   base  = min(500 × 2^(attempt-1), 8000)   ← 每次翻倍，但封顶 8s
+ *   delay = base × (1 + random × 0.25)        ← 加最多 25% 随机抖动
+ *
+ * 为什么加 Jitter？
+ * 多个客户端同时被限流后，如果等待时间完全相同，会在同一时刻同时重试，
+ * 再次打爆 API。随机抖动让各客户端的重试时间散开，避免"惊群效应"。
  */
 export function getRetryDelayMs(attempt: number, retryAfterMs: number | null): number {
   if (retryAfterMs !== null) return retryAfterMs
@@ -82,6 +103,16 @@ export function getRetryDelayMs(attempt: number, retryAfterMs: number | null): n
   return Math.floor(base + Math.random() * 0.25 * base)
 }
 
+/**
+ * 从 API 错误响应体中提取可读的错误信息。
+ *
+ * Anthropic 的错误格式是 { error: { message: "..." } }，
+ * 但不同 API 网关或代理可能返回不同结构，这里做了防御性解析：
+ *   1. { error: { message: string } }  ← 标准 Anthropic 格式
+ *   2. { error: string }               ← 简化格式
+ *   3. { message: string }             ← 通用格式
+ *   4. 以上都匹配不到时，fallback 到 "Model request failed: {status}"
+ */
 function extractErrorMessage(data: unknown, status: number): string {
   if (typeof data === 'object' && data !== null) {
     const d = data as Record<string, unknown>
@@ -98,8 +129,17 @@ function extractErrorMessage(data: unknown, status: number): string {
 // ── 消息格式转换 [K-06] ──────────────────────────────────────────────────────
 
 /**
- * 将块推入 Anthropic 消息数组，相邻同角色消息自动合并。
- * Anthropic API 要求：相邻的 user 或 assistant 消息必须合并为一条。
+ * 向输出数组追加一个内容块，自动处理同角色消息合并。
+ *
+ * Anthropic API 硬性要求：消息数组里不能出现相邻的同角色消息。
+ * 例如连续两次工具调用会产生两条 assistant_tool_call，转换后都是
+ * assistant 角色——如果分成两条消息发送，API 会报 400 错误。
+ *
+ * 解决方案：检查数组末尾，如果角色相同就把块追加进去，否则新建一条消息。
+ *
+ *   已有: [{ role: 'assistant', content: [block1] }]
+ *   追加: pushBlock(out, 'assistant', block2)
+ *   结果: [{ role: 'assistant', content: [block1, block2] }]  ← 合并
  */
 function pushBlock(
   out: AnthropicApiMessage[],
@@ -114,6 +154,15 @@ function pushBlock(
   }
 }
 
+/**
+ * 将 assistant_progress 消息包裹为 <progress> 标签后再发给模型。
+ *
+ * 为什么需要包裹？
+ * agent-loop（Phase 3）发现模型输出的是"进度更新"而非最终答案时，
+ * 会把这条消息以 assistant_progress 存入历史，然后继续推进任务。
+ * 下次调用 API 时，这条历史消息需要告诉模型"这是你之前说的中间进度"，
+ * 用 <progress> 标签标记能防止模型把它误判为最终回复。
+ */
 function assistantText(msg: Extract<ChatMessage, { role: 'assistant' | 'assistant_progress' }>): string {
   return msg.role === 'assistant_progress'
     ? `<progress>\n${msg.content}\n</progress>`
@@ -138,6 +187,7 @@ export function toAnthropicMessages(messages: ChatMessage[]): {
   for (const msg of messages) {
     switch (msg.role) {
       case 'system':
+        // 已在上面单独提取为 system 字段，这里跳过
         break
 
       case 'user':
@@ -146,16 +196,20 @@ export function toAnthropicMessages(messages: ChatMessage[]): {
 
       case 'assistant':
       case 'assistant_progress':
+        // assistant_progress 会被包裹为 <progress> 标签（见 assistantText）
         pushBlock(out, 'assistant', { type: 'text', text: assistantText(msg) })
         break
 
       case 'assistant_thinking':
+        // Extended Thinking 的思考块需要原样保留发回给模型，
+        // 否则模型不知道自己之前"想"了什么，多轮对话会断层
         for (const block of msg.blocks) {
           pushBlock(out, 'assistant', block as AnthropicContentBlock)
         }
         break
 
       case 'assistant_tool_call':
+        // 工具调用：内部用 toolUseId/toolName/input，API 要求 id/name/input
         pushBlock(out, 'assistant', {
           type: 'tool_use',
           id: msg.toolUseId,
@@ -165,15 +219,18 @@ export function toAnthropicMessages(messages: ChatMessage[]): {
         break
 
       case 'tool_result':
+        // 工具结果放在 user 角色里——这是 Anthropic API 的规定：
+        // 模型（assistant）发起调用，"环境"（user）返回结果
         pushBlock(out, 'user', {
           type: 'tool_result',
-          tool_use_id: msg.toolUseId,
+          tool_use_id: msg.toolUseId,  // 注意字段名：tool_use_id（下划线）不是 toolUseId
           content: msg.content,
           is_error: msg.isError,
         })
         break
 
       case 'context_summary':
+        // Phase 5 context-collapse 压缩后的摘要，以 user 消息形式告知模型历史被压缩过
         pushBlock(out, 'user', {
           type: 'text',
           text: `[Context Summary]\n${msg.content}`,
@@ -181,6 +238,8 @@ export function toAnthropicMessages(messages: ChatMessage[]): {
         break
 
       case 'snip_boundary':
+        // Phase 5 snip-compact 删除历史消息后插入的边界占位符，
+        // 告知模型：这里有一段对话被省略了
         pushBlock(out, 'user', {
           type: 'text',
           text: '[Earlier conversation history was truncated to save context space]',
@@ -192,6 +251,16 @@ export function toAnthropicMessages(messages: ChatMessage[]): {
   return { system, messages: out }
 }
 
+/**
+ * 将 Anthropic 原始 usage 字段归一化为内部 ProviderUsage 格式。
+ *
+ * 为什么要把 cache_creation_input_tokens 和 cache_read_input_tokens 加到 inputTokens？
+ * Anthropic 的 Prompt Cache 功能会把部分 token 计入缓存读写，
+ * 这些 token 仍然产生费用（只是比普通 input token 便宜），
+ * 加总后才是"本次请求实际消耗的总输入 token 数"，用于展示和限额控制。
+ *
+ * totalTokens <= 0 时返回 undefined，避免把空 usage 对象传播出去。
+ */
 function normalizeUsage(usage: AnthropicUsage | undefined): ProviderUsage | undefined {
   if (!usage) return undefined
   const inputTokens =
@@ -204,7 +273,19 @@ function normalizeUsage(usage: AnthropicUsage | undefined): ProviderUsage | unde
   return { inputTokens, outputTokens, totalTokens, source: 'anthropic' }
 }
 
-// 解析 <final> / <progress> / [FINAL] / [PROGRESS] 标记
+/**
+ * 解析模型输出文本里的状态标记，提取内容和状态类型。
+ *
+ * 为什么需要这个？
+ * Agent Loop（Phase 3）需要判断模型的回复是"任务完成"还是"中间进度"。
+ * 通过约定 System Prompt 要求模型用标签包裹回复，这里负责解析：
+ *   <final>任务完成，最终答案</final>     → kind: 'final'
+ *   <progress>正在处理，稍等</progress>  → kind: 'progress'（Loop 继续推进）
+ *   没有标签                              → kind: undefined（视上下文而定）
+ *
+ * 支持 [FINAL] / [PROGRESS] 方括号格式是为了兼容部分模型不擅长输出尖括号的情况。
+ * 闭合标签（</final>、</progress>）用正则替换掉，因为模型有时会漏写。
+ */
 function parseMarkers(text: string): { content: string; kind?: 'final' | 'progress' } {
   if (!text) return { content: '' }
   const markers: Array<{ prefix: string; kind: 'final' | 'progress' }> = [
