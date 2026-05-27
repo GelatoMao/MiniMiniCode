@@ -1,4 +1,4 @@
-# my-agent
+# miniminicode
 
 用 TypeScript 一比一重实现 [MiniCode](../MiniCode)，通过"带注解复刻 + 理解后重写"的方式深入掌握 Agent 原理。
 
