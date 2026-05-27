@@ -16,43 +16,160 @@
 
 ### [K-01] 可辨识联合类型（Discriminated Union）
 
-> 待实现 Phase 1 时填写
+**文件**：`src/types.ts`
+
+TypeScript 通过字面量类型作为辨别字段（discriminant），在 if/switch 分支里自动收窄类型，无需手写类型断言。
+
+```typescript
+type ChatMessage =
+  | { role: 'user'; content: string }
+  | { role: 'assistant_tool_call'; toolUseId: string; toolName: string; input: unknown }
+
+function handle(msg: ChatMessage) {
+  if (msg.role === 'user') {
+    console.log(msg.content) // 这里 msg 被自动收窄，只有 content 字段
+  }
+}
+```
+
+**为什么用它**：一个类型涵盖所有消息形态；编译器穷举检查；避免运行时 `instanceof`。
+
+---
 
 ### [K-02] Zod 运行时校验
 
-> 待实现 Phase 1 时填写
+**文件**：`src/tool.ts` → `ToolRegistry.execute()`
+
+TypeScript 类型只在编译期存在，LLM 返回的 JSON 是 `unknown`。Zod 的 `.safeParse()` 在运行时桥接两者：
+
+```typescript
+const parsed = tool.schema.safeParse(input) // 不抛异常
+if (!parsed.success) {
+  return { ok: false, output: parsed.error.message }
+}
+// parsed.data 类型已被收窄为 TInput
+await tool.run(parsed.data, context)
+```
+
+**关键 API**：`.safeParse()` 返回 `{ success, data | error }`；`z.infer<typeof schema>` 从 schema 推断 TS 类型（DRY）。
+
+---
 
 ### [K-03] 注册表模式（Registry Pattern）
 
-> 待实现 Phase 1 时填写
+**文件**：`src/tool.ts` → `ToolRegistry`
+
+集中管理工具的注册、查找和执行。Agent Loop 只通过 ToolRegistry 与工具交互。
+
+```
+Agent Loop
+  → registry.execute(name, input, ctx)
+    → find(name)         # 查找
+    → schema.safeParse() # 验证 [K-02]
+    → tool.run()         # 执行
+```
+
+**SOLID 对应**：S（单一职责）、O（开放/封闭：addTools 无需改 Loop）、D（Loop 依赖 Registry 抽象）。
+
+---
 
 ### [K-04] 配置分层加载
 
-> 待实现 Phase 1 时填写
+**文件**：`src/config.ts`
 
-### [K-05] Node.js 路径处理
+Phase 2 仅从环境变量加载，Phase 5 会扩展为 `settings.json` → `.claude/settings.json` → 环境变量 三层合并：
 
-> 待实现 Phase 1 时填写
+```typescript
+const apiKey = (process.env['ANTHROPIC_API_KEY'] ?? '').trim() || undefined
+```
+
+**设计原则**：`async` 函数而非模块顶层执行，方便测试注入和动态刷新。
+
+---
+
+### [K-05] ToolContext 依赖注入
+
+**文件**：`src/tool.ts`
+
+```typescript
+type ToolContext = { cwd: string }
+```
+
+通过参数传入运行时环境而非全局变量，测试时可注入任意 `cwd`，无副作用。
 
 ---
 
 ## 第二层：模型接入
 
-### [K-06] Anthropic Messages API 协议
+### [K-06] Anthropic Messages API 格式转换
 
-> 待实现 Phase 2 时填写
+**文件**：`src/anthropic-adapter.ts` → `toAnthropicMessages()`
 
-### [K-07] 指数退避 + Jitter
+内部 `ChatMessage[]` 与 Anthropic API 格式的关键差异：
 
-> 待实现 Phase 2 时填写
+| 内部格式 | Anthropic API |
+|---------|--------------|
+| `system` | 独立 `system` 字段，不进 messages |
+| `user` | `{ role: 'user', content: [{ type: 'text', text }] }` |
+| `assistant_tool_call` | `{ role: 'assistant', content: [{ type: 'tool_use', id, name, input }] }` |
+| `tool_result` | `{ role: 'user', content: [{ type: 'tool_result', tool_use_id, content }] }` |
+| `assistant_progress` | `{ type: 'text', text: '<progress>...</progress>' }` |
 
-### [K-08] Tool Use 响应解析
+**关键约束**：相邻同角色消息必须合并为一条（`pushBlock` 函数处理）。
 
-> 待实现 Phase 2 时填写
+---
+
+### [K-07] 指数退避 + Jitter 重试策略
+
+**文件**：`src/anthropic-adapter.ts` → `getRetryDelayMs()`
+
+触发条件：HTTP 429（限流）或 5xx（服务端错误）。
+
+```
+delay = min(500 × 2^(attempt-1), 8000) × (1 + random × 0.25)
+```
+
+- **指数退避**：每次重试间隔翻倍，避免持续冲击限流 API
+- **Jitter（抖动）**：加入随机因子，防止多客户端同时重试的"惊群效应"
+- **Retry-After 优先**：服务端返回等待时间时直接使用
+
+---
+
+### [K-08] Tool Use 响应块解析
+
+**文件**：`src/anthropic-adapter.ts` → `AnthropicModelAdapter.next()`
+
+Anthropic API 响应的 `content` 是混合块数组，按 `type` 分拣：
+
+```typescript
+for (const block of data.content ?? []) {
+  if (block.type === 'text')      textParts.push(block.text)
+  else if (block.type === 'tool_use')  toolCalls.push(...)
+  else if (block.type === 'thinking') thinkingBlocks.push(block)
+  else ignoredBlockTypes.add(block.type) // 容错未来新块类型
+}
+```
+
+**决策**：`toolCalls.length > 0` → `tool_calls`；否则 → `assistant`。
+
+---
 
 ### [K-09] 适配器模式（Adapter Pattern）
 
-> 待实现 Phase 2 时填写
+**文件**：`src/anthropic-adapter.ts`、`src/mock-model.ts`
+
+`ModelAdapter` 接口将 Agent Loop 与具体 LLM 提供商解耦：
+
+```typescript
+interface ModelAdapter {
+  next(messages: ChatMessage[]): Promise<AgentStep>
+}
+```
+
+- `AnthropicModelAdapter` → 真实 API 调用
+- `MockModelAdapter` → slash 命令解析，无网络，测试专用
+
+**依赖倒置（DIP）**：Agent Loop 只依赖 `ModelAdapter` 接口，不关心底层实现。
 
 ---
 
