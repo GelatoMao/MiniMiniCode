@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterEach } from 'vitest'
 import { isEnoentError, getErrorCode } from '../src/utils/errors.js'
 import { resolveMaxOutputTokens } from '../src/utils/context.js'
+import { loadRuntimeConfig } from '../src/config.js'
 
 describe('isEnoentError', () => {
   it('code=ENOENT 的 Error 对象返回 true', () => {
@@ -40,5 +41,38 @@ describe('resolveMaxOutputTokens', () => {
   it('配置值为 0 或负数时使用默认值', () => {
     expect(resolveMaxOutputTokens('claude-sonnet-4-6', 0)).toBe(64_000)
     expect(resolveMaxOutputTokens('claude-sonnet-4-6', -1)).toBe(64_000)
+  })
+})
+
+describe('loadRuntimeConfig', () => {
+  const saved: Record<string, string | undefined> = {}
+
+  afterEach(() => {
+    // 恢复环境变量
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+
+  it('读取 ANTHROPIC_API_KEY 和 ANTHROPIC_MODEL', async () => {
+    saved['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY']
+    saved['ANTHROPIC_MODEL'] = process.env['ANTHROPIC_MODEL']
+    saved['ANTHROPIC_BASE_URL'] = process.env['ANTHROPIC_BASE_URL']
+    process.env['ANTHROPIC_API_KEY'] = 'test-key'
+    process.env['ANTHROPIC_MODEL'] = 'claude-test'
+    delete process.env['ANTHROPIC_BASE_URL']
+    const cfg = await loadRuntimeConfig()
+    expect(cfg.apiKey).toBe('test-key')
+    expect(cfg.model).toBe('claude-test')
+    expect(cfg.baseUrl).toBe('https://api.anthropic.com')
+  })
+
+  it('未设置任何 auth 时抛出错误', async () => {
+    saved['ANTHROPIC_API_KEY'] = process.env['ANTHROPIC_API_KEY']
+    saved['ANTHROPIC_AUTH_TOKEN'] = process.env['ANTHROPIC_AUTH_TOKEN']
+    delete process.env['ANTHROPIC_API_KEY']
+    delete process.env['ANTHROPIC_AUTH_TOKEN']
+    await expect(loadRuntimeConfig()).rejects.toThrow('ANTHROPIC_API_KEY')
   })
 })
