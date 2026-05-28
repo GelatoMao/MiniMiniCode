@@ -177,27 +177,111 @@ interface ModelAdapter {
 
 ### [K-10] ReAct 框架
 
-> 待实现 Phase 3 时填写
+**文件**：`src/agent-loop.ts` → `runAgentTurn()`
+
+ReAct = **Re**ason（推理）+ **Act**（执行）的交替循环。
+
+```
+┌──────────────────────────────────────────────┐
+│  for step in maxSteps:                       │
+│    next = model.next(messages)               │
+│    ┌── 'assistant' ──► 退出循环（或重试）    │
+│    └── 'tool_calls' ──► 执行工具 ──► 继续   │
+└──────────────────────────────────────────────┘
+```
+
+每一轮都向 `messages` 追加新消息，消息历史是模型"记忆"的唯一载体。
+`maxSteps` 是安全阀，防止模型进入无限工具调用循环。
+
+---
 
 ### [K-11] 工具执行与错误收集
 
-> 待实现 Phase 3 时填写
+**文件**：`src/agent-loop.ts` → `tool_calls` 分支
+
+**三个设计决策：**
+
+1. **顺序执行（非并行）**：工具 B 的输入可能依赖工具 A 的输出，串行更安全。
+2. **失败不中断**：一个工具失败后继续执行剩余工具，错误作为 `isError=true` 的 `tool_result` 反馈给模型，让模型自行决策是重试还是换策略。
+3. **awaitUser 信号例外**：收到此信号后立即 `break`，不再执行后续工具，因为需要等待用户输入后才能继续。
+
+```typescript
+for (const call of next.calls) {
+  const result = await tools.execute(call.toolName, call.input, { cwd })
+  toolCallMessages.push({ role: 'assistant_tool_call', ... })
+  toolResultMessages.push({ role: 'tool_result', isError: !result.ok, ... })
+  if (result.awaitUser) break  // [K-26] 暂停等待用户
+}
+messages = [...messages, ...toolCallMessages, ...toolResultMessages]
+```
+
+---
 
 ### [K-12] 韧性设计模式（Resilience Patterns）
 
-> 待实现 Phase 3 时填写
+**文件**：`src/agent-loop.ts`
+
+三类异常情况及恢复策略：
+
+| 异常 | 触发条件 | 恢复策略 |
+|------|---------|---------|
+| 空响应 | `content.trim() === ''` | 注入 continuation prompt，最多重试 2 次；耗尽后降级输出提示消息 |
+| Thinking 阶段中断 | `stopReason=pause_turn/max_tokens` 且有 thinking block | 注入 continuation prompt，最多重试 3 次 |
+| maxSteps 超限 | `step >= maxSteps` | 退出循环，输出"达到最大步数"提示消息 |
+
+**为什么空响应要重试而不立即报错？**
+LLM 在复杂上下文下偶尔会产生空输出（特别是 Extended Thinking 场景），通常一次 continuation prompt 就能恢复。重试成本低，直接报错会中断本可以完成的任务。
+
+---
 
 ### [K-13] Continuation Prompt 工程
 
-> 待实现 Phase 3 时填写
+**文件**：`src/agent-loop.ts` → `pushContinuationPrompt()`
+
+Agent Loop 在三种情况下注入 continuation prompt（作为 `user` 角色消息追加到历史）：
+
+1. **空响应**：`'Your last response was empty. Continue immediately...'`
+2. **Progress 消息**：`'Continue immediately from your <progress> update...'`
+3. **Thinking 中断**：`'Your previous response hit max_tokens during thinking. Resume immediately...'`
+
+设计要点：
+- 必须是 `user` 角色（模型视角：用户催促继续），而非 `assistant`
+- 措辞要求"立即"行动（immediately），防止模型再次产生纯文字分析
+- 根据上下文（是否有工具结果、错误）选择不同措辞，帮助模型理解当前状态
+
+---
 
 ### [K-14] Extended Thinking 跨轮次状态管理
 
-> 待实现 Phase 3 时填写
+**文件**：`src/agent-loop.ts` → `appendThinkingBlocks()`
+
+Extended Thinking 的关键约束：
+
+> Anthropic API 要求：如果上一轮响应包含 `thinking` 块，下一轮请求的 messages 中必须包含对应的 `assistant_thinking` 消息，否则 API 会报错（thinking block 缺失）。
+
+**实现**：每次模型返回（无论是 `assistant` 还是 `tool_calls`），都先检查 `thinkingBlocks` 字段，非空时立即追加 `assistant_thinking` 消息到 `messages`，然后再处理其他逻辑。
+
+```typescript
+// 保留 thinking blocks 的位置：先于一切其他消息追加
+messages = appendThinkingBlocks(messages, next.thinkingBlocks)
+```
+
+---
 
 ### [K-15] System Prompt 工程
 
-> 待实现 Phase 3 时填写
+**文件**：`src/prompt.ts` → `buildSystemPrompt()`
+
+System Prompt 是模型行为的"宪法"，需要覆盖：
+
+| 内容 | 作用 |
+|------|------|
+| 角色定义 | 告诉模型它是谁（mini-code，终端编程助手）|
+| 工作目录 `cwd` | 让模型知道工具操作的默认路径 |
+| 行为偏好 | 优先动手而非给建议；不做未被要求的主观选择 |
+| 结构化响应协议 | 约定 `<progress>`/`<final>` 标签，Agent Loop 据此判断是否退出 |
+
+Phase 5 会在此基础上扩展：注入权限摘要、skills 列表、MCP 服务器信息、MEMORY 文件内容（K-40）。
 
 ---
 
