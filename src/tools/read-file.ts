@@ -7,9 +7,9 @@
  * 3. run(input, context) → 类型安全的执行逻辑
  */
 import { readFile } from 'node:fs/promises'
-import path from 'node:path'
 import { z } from 'zod'
 import type { ToolDefinition } from '../tool.js'
+import { resolveToolPath } from '../workspace.js'
 
 // [K-02] Zod 推断出的类型：{ path: string; offset?: number; limit?: number }
 type Input = z.infer<typeof inputSchema>
@@ -44,11 +44,11 @@ export const readFileTool: ToolDefinition<Input> = {
   schema: inputSchema,
 
   async run(input, context) {
-    // path.resolve 确保路径始终在 cwd 下（简单安全防护）
-    const target = path.resolve(context.cwd, input.path)
-
+    let target: string
     let content: string
     try {
+      // [K-05] resolveToolPath 统一处理路径解析 + 权限检查
+      target = await resolveToolPath(context, input.path, 'read')
       content = await readFile(target, 'utf8')
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)

@@ -1,3 +1,9 @@
+import os from 'node:os'
+import path from 'node:path'
+
+// [K-04] mini-code 本地数据目录（权限持久化、会话存储等）
+export const MINI_CODE_DIR = path.join(os.homedir(), '.mini-code')
+
 // [K-06] Phase 2 仅从环境变量加载配置（Phase 5 会扩展为读取 settings.json）
 export type RuntimeConfig = {
   model: string
