@@ -1,6 +1,28 @@
 import { z } from 'zod'
 
 /**
+ * [K-29] PermissionManagerLike：权限管理器接口
+ *
+ * 用接口而非具体类型，避免 tool.ts ↔ permissions.ts 循环依赖。
+ * permissions.ts 中的 PermissionManager 实现此接口。
+ */
+export type PermissionManagerLike = {
+  ensurePathAccess(
+    targetPath: string,
+    intent: 'read' | 'write' | 'list' | 'search' | 'command_cwd',
+  ): Promise<void>
+  ensureCommand(
+    command: string,
+    args: string[],
+    cwd: string,
+    reason: string,
+    opts?: { forcePromptReason?: string },
+  ): Promise<void>
+  ensureEdit(targetPath: string, diffPreview: string): Promise<void>
+  resetTurn(): void
+}
+
+/**
  * [K-05] ToolContext：工具执行时的运行时环境
  *
  * 通过依赖注入而非全局变量传递，方便测试隔离。
@@ -8,6 +30,8 @@ import { z } from 'zod'
 export type ToolContext = {
   /** 工具操作的工作目录 */
   cwd: string
+  /** [K-29] 可选权限管理器；无时默认仅限 workspace 内路径访问 */
+  permissions?: PermissionManagerLike
 }
 
 /**
@@ -66,6 +90,7 @@ export type ToolDefinition<TInput> = {
 export class ToolRegistry {
   // 用 unknown 而非具体泛型，允许存储任意 TInput 的工具
   private readonly toolsStore: ToolDefinition<unknown>[]
+  private disposers: Array<() => Promise<void>> = []
 
   constructor(tools: ToolDefinition<unknown>[] = []) {
     this.toolsStore = [...tools]
@@ -92,6 +117,22 @@ export class ToolRegistry {
       this.toolsStore.push(tool)
       existingNames.add(tool.name)
     }
+  }
+
+  /** 注册清理函数（例如 MCP 连接关闭），dispose() 时批量调用 */
+  addDisposer(fn: () => Promise<void>): void {
+    this.disposers.push(fn)
+  }
+
+  /** 关闭所有已注册的清理资源 */
+  async dispose(): Promise<void> {
+    await Promise.all(this.disposers.map(fn => fn()))
+  }
+
+  /** Phase 5 MCP 占位：存储 server 摘要 */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  setMcpServers(_servers: unknown[]): void {
+    // Phase 5 实现
   }
 
   /**

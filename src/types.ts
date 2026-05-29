@@ -161,3 +161,15 @@ export type CompressionResult = {
   tokensBefore: number
   tokensAfter: number
 }
+
+// ── 后台任务（K-31）────────────────────────────────────────────────────────
+export type BackgroundTaskStatus = 'running' | 'completed' | 'failed'
+
+export type BackgroundTaskResult = {
+  taskId: string
+  type: 'local_bash'
+  command: string
+  pid: number
+  status: BackgroundTaskStatus
+  startedAt: number
+}
